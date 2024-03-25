@@ -1,38 +1,40 @@
 import csv
 from collections import deque
-from machine import Machine, MachineHolder, CpuCapacity
 import simpy
+import numpy as np
 import pandas as pd
 import math
 import configparser
+from datetime import datetime
 from matplotlib import pyplot as plt
+
+from machine import Machine, MachineHolder, CpuCapacity
 
 
 CPU_USAGE = []
 MEMORY_USAGE = []
 
 class Task(object):
-    cpu_resource: float
-    memory_resource: float
+    cpu_request: float
+    memory_request: float
     runtime: float
     expected_finished: float
     is_running: bool = False
 
     def __init__(self, cpu, memory, runtime) -> None:
-        self.cpu_resource = cpu
-        self.memory_resource = memory
+        self.cpu_request = cpu
+        self.memory_request = memory
         self.runtime = runtime
 
-    def start_running(self, env: simpy.Environment, instance_attached: "Instance"):
+    def start_running(self, env: simpy.Environment, instance_attached: "Instance", scheduler: "Scheduler"):
         self.is_running = True
         yield env.timeout(self.runtime)
-        # print(f"Task finished at {env.now}")
         self.is_running = False
+        scheduler.current_memory_requested -= self.memory_request
+        scheduler.current_cpu_requested -= self.cpu_request
 
-        if self.cpu_resource > 0:
-            yield instance_attached.cpu_resource.put(self.cpu_resource)
-        if self.memory_resource > 0:
-            yield instance_attached.memory_resource.put(self.memory_resource)
+        instance_attached.current_cpu += self.cpu_request
+        instance_attached.current_memory += self.memory_request
 
         instance_attached.tasks.remove(self) 
         
@@ -40,41 +42,42 @@ class Task(object):
 class Instance(object):
     machine: Machine
     env: simpy.RealtimeEnvironment
-    cpu_resource: simpy.Container
-    memory_resource: simpy.Container
+    current_cpu: float
+    current_memory: float
     tasks: list[Task]
 
     def __init__(self, machine: Machine, env: simpy.RealtimeEnvironment) -> None:
         self.machine = machine
         self.env = env
-        self.cpu_resource = simpy.Container(env, capacity=machine.cpu, init=machine.cpu)
-        self.memory_resource = simpy.Container(env, capacity=machine.memory, init=machine.memory)
+        self.current_cpu = machine.cpu
+        self.current_memory = machine.memory
         self.tasks = []
 
     def can_receive_workload(self, cpu_need: float, memory_need: float):
-        return self.cpu_resource.level >= cpu_need and self.memory_resource.level >= memory_need
+        return self.current_cpu >= cpu_need and self.current_memory >= memory_need
 
-    def receive_task(self, task: Task):
+    def receive_task(self, task: Task, scheduler: "Scheduler"):
         self.tasks.append(task)
         try:
-            if task.cpu_resource > 0:
+            if task.cpu_request > 0:
                 task.succesful_get_cpu = False
-                yield self.cpu_resource.get(task.cpu_resource)
+                self.current_cpu -= task.cpu_request
                 task.succesful_get_cpu = True
-            if task.memory_resource > 0:
+            if task.memory_request > 0:
                 task.succesful_get_memory = False
-                yield self.memory_resource.get(task.memory_resource)
+                self.current_memory -= task.memory_request
                 task.succesful_get_memory = True
         except simpy.Interrupt as interrupt:
             if hasattr(task, "succesful_get_cpu") and task.succesful_get_cpu:
-                yield self.cpu_resource.put(task.cpu_resource)
+                self.current_cpu += task.cpu_request
             if hasattr(task, "succesful_get_memory") and task.succesful_get_memory:
-                yield self.memory_resource.put(task.memory_resource)
+                self.current_memory += task.memory_request
             self.tasks.remove(task)
-            return
+            return False
 
         task.expected_finished = self.env.now + task.runtime
-        self.env.process(task.start_running(self.env, self))
+        self.env.process(task.start_running(self.env, self, scheduler))
+        return True
 
     def get_longest_remaining_runtime(self) -> float:
         if not self.tasks:
@@ -84,21 +87,23 @@ class Instance(object):
 
 
 class Scheduler(object):
-    BIN_STEP = 450
+    BIN_STEP = 180
     runtime_bins: list[list[Instance]]
-    no_of_queues = 1
-    tasks_queue: list[deque[Task]]
-    read_all = False
+    normalized_resource_matrix: np.ndarray
+    tasks_queue: deque[Task]
+    read_all: bool = False
     num_of_tasks_assigned: int = 0
     num_of_time_get_machine: int = 0
     num_of_time_retrive_machine: int = 0
-    dequeue_all: list[bool]
+    current_cpu_requested: float = 0
+    current_memory_requested: float = 0
+    dequeue_all: bool = False
     keep_logging: list[bool]
     machine_holder: MachineHolder
     env: simpy.RealtimeEnvironment
 
     task_queue_thread: simpy.Process
-    task_dequeue_threads: list[simpy.Process]
+    task_dequeue_thread: simpy.Process
     task_update_binIdx_threads: list[simpy.Process]
     machine_usage_logging_thread: simpy.Process
 
@@ -117,19 +122,18 @@ class Scheduler(object):
     def __init__(self, no_of_bins: int, env: simpy.RealtimeEnvironment, tasks_csv_path: str, vendor: MachineHolder) -> None:
         self.env = env
         self.create_bins(no_of_bins=no_of_bins)
-        self.tasks_queue = [deque() for i in range(self.no_of_queues)]
+        self.tasks_queue = deque()
         self.machine_holder = vendor
 
-        self.dequeue_all = [False for _ in range(self.no_of_queues)]
         self.keep_logging = [True for _ in range(len(self.runtime_bins))]
         self.task_queue_thread = self.env.process(self.add_task_to_queue(tasks_csv_path))
         self.machine_usage_logging_thread = self.env.process(self.machine_holder.log(self, CPU_USAGE, MEMORY_USAGE))
 
-    def assign_task_check_start_time(self, start_time: float, task: Task, queue_idx: int) -> bool:
+    def assign_task_check_start_time(self, start_time: float, task: Task) -> bool:
         if start_time > self.env.now:
             return False
         else:
-            self.tasks_queue[queue_idx].append(task)
+            self.tasks_queue.append(task)
             return True
 
     def add_task_to_queue(self, tasks_csv_path: str):
@@ -141,123 +145,148 @@ class Scheduler(object):
         for row in reader:
             start_time = float(row[0])
             task = Task(float(row[1]), float(row[2]), float(row[3]))
-            if task.runtime > 1e5:
-                continue
-            queue_idx = read % self.no_of_queues
-            while not self.assign_task_check_start_time(start_time, task, queue_idx):
+            while not self.assign_task_check_start_time(start_time, task):
                 timeout = start_time - self.env.now
                 if timeout > 0:
                     yield self.env.timeout(timeout)
             read += 1
-            if read == 1e6:
+            if read == 1e7:
                 break
 
         print("All tasks read")
         self.read_all = True
         f.close()
 
+    def try_assign_task_to_instance(self, task: Task, inst: Instance):
+        if inst.receive_task(task, self):
+            self.current_cpu_requested += task.cpu_request
+            self.current_memory_requested += task.memory_request
+            self.num_of_tasks_assigned += 1
+            return True
+        
+        return False
+
     def try_assign_task(self, task: Task, bin_idx: int):
         for inst in self.runtime_bins[bin_idx]:
-            if inst.can_receive_workload(task.cpu_resource, task.memory_resource):
-                try_assign = self.env.process(inst.receive_task(task))
-                waiting = self.env.timeout(1)
-                yield try_assign | waiting
-                if not try_assign.triggered:
-                    try_assign.interrupt("Timeout")
-                    continue
-                else:
+            if inst.can_receive_workload(task.cpu_request, task.memory_request):
+                if self.try_assign_task_to_instance(task, inst):
                     return True
         return False
     
-    def dequeue_task_and_assign_baseline(self, id: int):
-        while self.tasks_queue[id]:
-            task = self.tasks_queue[id].popleft()
+    def get_new_machine_assign_task_baseline(self, task: Task, bin_idx: int):
+        machine = self.machine_holder.getSingleMachine()
+        if machine is not None:
+            self.num_of_time_get_machine += 1
+            inst = Instance(machine, self.env)
+            self.try_assign_task_to_instance(task, inst)
+            self.runtime_bins[bin_idx].append(inst)
+            return True
+        else:
+            return False
+    
+    def dequeue_task_and_assign_baseline(self):
+        while self.tasks_queue:
+            task = self.tasks_queue.popleft()
             bin_idx = 0 # only 1 bin = baseline
-            succesful_assigned = yield self.env.process(self.try_assign_task(task, bin_idx))
+            succesful_assigned = self.try_assign_task(task, bin_idx)
             if succesful_assigned:
-                self.num_of_tasks_assigned += 1
                 continue
             else:
-                for cpu_capacity in CpuCapacity:
-                    if cpu_capacity >= task.cpu_resource:
-                        machine = self.machine_holder.getSingleMachine(cpu_capacity, task.memory_resource)
-                        if machine is not None:
-                            self.num_of_time_get_machine += 1
-                            inst = Instance(machine, self.env)
-                            self.env.process(inst.receive_task(task))
-                            # print("Task assigned to new instance")
-                            self.num_of_tasks_assigned += 1
-                            self.runtime_bins[bin_idx].append(inst)
-                            break
-                        else:
-                            if not CpuCapacity.is_max_cpu(cpu_capacity):
-                                continue
-                            else:
-                                self.tasks_queue[id].appendleft(task)
-                                # print(f"Task is waiting for machine")
-                                yield self.env.timeout(10)
+                succesful_assigned = self.get_new_machine_assign_task_baseline(task, bin_idx)
+                if succesful_assigned:
+                    continue
+                else:
+                    self.tasks_queue.appendleft(task)
+                    yield self.env.timeout(10)
 
         if not self.read_all:
             print(f"Number of tasks assigned: {self.num_of_tasks_assigned}")
             yield self.env.timeout(10)
-            yield self.env.process(self.dequeue_task_and_assign_baseline(id))
+            yield self.env.process(self.dequeue_task_and_assign_baseline())
 
-        self.dequeue_all[id] = True
+        self.dequeue_all = True
 
 
-    def dequeue_task_and_assign(self, id: int):
-        while self.tasks_queue[id]:
-            task = self.tasks_queue[id].popleft()
+    def get_eligible_instance_similar_runtime(self, task: Task, bin_idx: int):
+        eligible_insts = [inst for inst in self.runtime_bins[bin_idx] if inst.can_receive_workload(task.cpu_request, task.memory_request)]
+        if eligible_insts:
+            subtract_runtimes = [abs(inst.get_longest_remaining_runtime() - task.runtime) for inst in eligible_insts]
+            return eligible_insts[np.argmin(subtract_runtimes)]
+
+
+    def get_eligible_instance_most_resources(self, task: Task, bin_idx: int):
+        eligible_insts = [inst for inst in self.runtime_bins[bin_idx] if inst.can_receive_workload(task.cpu_request, task.memory_request)]
+        if eligible_insts:
+            return eligible_insts[np.argmax([inst.current_cpu  * inst.current_memory for inst in eligible_insts])]
+        
+    
+    def get_new_instance(self):
+        new_machine = self.machine_holder.getSingleMachine()
+        if new_machine is not None:
+            self.num_of_time_get_machine += 1
+            return Instance(new_machine, self.env)
+        
+        return None
+
+
+    def dequeue_task_and_assign(self):
+        while self.tasks_queue:
+            succesful_assigned = False
+            # get the task
+            task = self.tasks_queue.popleft()
+            # get the bin index of this task's runtime
             bin_idx = self.get_bin_idx(task.runtime)
             
-            next_bin_idx = bin_idx
-            while next_bin_idx < len(self.runtime_bins):
-                succesful_assigned = yield self.env.process(self.try_assign_task(task, next_bin_idx))
+            # check if there is any instance with similar runtime in the same bin
+            same_bin_inst = self.get_eligible_instance_similar_runtime(task, bin_idx)
+            if same_bin_inst is not None:
+                succesful_assigned = self.try_assign_task_to_instance(task, same_bin_inst)
                 if succesful_assigned:
-                    self.num_of_tasks_assigned += 1
-                    break
+                    continue
+
+            # checking in the greater bins
+            next_bin_idx = bin_idx + 1
+            while not succesful_assigned and next_bin_idx < len(self.runtime_bins):
+                next_bin_inst = self.get_eligible_instance_most_resources(task, next_bin_idx)
+                if next_bin_inst is not None:
+                    succesful_assigned = self.try_assign_task_to_instance(task, next_bin_inst)
                 else:
                     next_bin_idx += 1
             
-            if not task.is_running:
+            # checking in the smaller bins
+            if not succesful_assigned:
                 next_bin_idx = bin_idx - 1
-                while next_bin_idx >= 0:
-                    yield self.env.process(self.try_assign_task(task, next_bin_idx))
-                    if task.is_running:
-                        self.num_of_tasks_assigned += 1
-                        break
+                while not succesful_assigned and next_bin_idx >= 0:
+                    prev_bin_inst = self.get_eligible_instance_most_resources(task, next_bin_idx)
+                    if prev_bin_inst is not None:
+                        succesful_assigned = self.try_assign_task_to_instance(task, prev_bin_inst)
+                        if succesful_assigned:
+                            # instance is moved to the current bin
+                            idx = self.runtime_bins[next_bin_idx].index(prev_bin_inst)
+                            self.runtime_bins[bin_idx].append(self.runtime_bins[next_bin_idx].pop(idx))
                     else:
                         next_bin_idx -= 1
 
-            if not task.is_running:
-                for cpu_capacity in CpuCapacity:
-                    if cpu_capacity >= task.cpu_resource:
-                        machine = self.machine_holder.getSingleMachine(cpu_capacity, task.memory_resource)
-                        if machine is not None:
-                            self.num_of_time_get_machine += 1
-                            inst = Instance(machine, self.env)
-                            self.env.process(inst.receive_task(task))
-                            # print("Task assigned to new instance")
-                            self.num_of_tasks_assigned += 1
-                            self.runtime_bins[bin_idx].append(inst)
-                            break
-                        else:
-                            if not CpuCapacity.is_max_cpu(cpu_capacity):
-                                continue
-                            else:
-                                self.tasks_queue[id].appendleft(task)
-                                # print(f"Task is waiting for machine")
-                                yield self.env.timeout(10)
+            # if still not assigned, then assign to new instance
+            if not succesful_assigned:
+                new_inst = self.get_new_instance()
+                if new_inst is not None:
+                    succesful_assigned = self.try_assign_task_to_instance(task, new_inst)
+                    if succesful_assigned:
+                        self.runtime_bins[self.get_bin_idx(task.runtime)].append(new_inst)
+                else:
+                    self.tasks_queue.appendleft(task)
+                    yield self.env.timeout(10)
 
         if not self.read_all:
             print(f"Number of tasks assigned: {self.num_of_tasks_assigned}")
             yield self.env.timeout(10)
-            yield self.env.process(self.dequeue_task_and_assign(id))
+            yield self.env.process(self.dequeue_task_and_assign())
 
-        self.dequeue_all[id] = True
+        self.dequeue_all = True
 
     def update_binIdx(self, bin_idx: int):
-        while any(self.runtime_bins) or not all(self.dequeue_all):
+        while any(self.runtime_bins) or not self.dequeue_all:
             self.update_binIdx_helper(bin_idx)
             yield self.env.timeout(self.BIN_STEP * 2**(bin_idx - 2))    
 
@@ -265,7 +294,7 @@ class Scheduler(object):
         self.keep_logging[bin_idx] = False
 
     def update_binIdx_baseline(self):
-        while self.runtime_bins[0] or not all(self.dequeue_all):
+        while self.runtime_bins[0] or not self.dequeue_all:
             self.update_binIdx_helper_baseline()
             yield self.env.timeout(self.BIN_STEP * 2**-2)    
 
@@ -281,7 +310,6 @@ class Scheduler(object):
         while i >= 0:
             longest_runtime = self.runtime_bins[0][i].get_longest_remaining_runtime()
             total_tasks += len(self.runtime_bins[0][i].tasks)
-            # print(f"number of tasks in instance {i}: {len(self.runtime_bins[bin][i].tasks)}, longest runtime: {longest_runtime}")
             # remove the machines if no task is running
             if longest_runtime <= 0:
                 self.machine_holder.retriveSingleMachine(self.runtime_bins[0].pop(i).machine)
@@ -303,7 +331,6 @@ class Scheduler(object):
         while i >= 0:
             longest_runtime = self.runtime_bins[bin][i].get_longest_remaining_runtime()
             total_tasks += len(self.runtime_bins[bin][i].tasks)
-            # print(f"number of tasks in instance {i}: {len(self.runtime_bins[bin][i].tasks)}, longest runtime: {longest_runtime}")
             # remove the machines if no task is running
             if longest_runtime <= 0:
                 self.machine_holder.retriveSingleMachine(self.runtime_bins[bin].pop(i).machine)
@@ -321,19 +348,17 @@ class Scheduler(object):
         if remove > 0:
             print(f"Removed {remove} empty instances")
         print("-" * 50)
-        # print(f"Number of time get machine: {self.num_of_time_get_machine}")
-        # print(f"Number of time retrive machine: {self.num_of_time_retrive_machine}")
 
     def run(self):
         yield self.task_queue_thread \
-            & self.env.process(self.dequeue_task_and_assign(0)) \
+            & self.env.process(self.dequeue_task_and_assign()) \
             & simpy.AllOf(self.env, [self.env.process(self.update_binIdx(i)) for i in range(len(self.runtime_bins))]) \
             & self.machine_usage_logging_thread
         print("Finished!!!")
 
     def run_baseline(self):
         yield self.task_queue_thread \
-            & self.env.process(self.dequeue_task_and_assign_baseline(0)) \
+            & self.env.process(self.dequeue_task_and_assign_baseline()) \
             & self.env.process(self.update_binIdx_baseline()) \
             & self.machine_usage_logging_thread
         print("Finished!!!")
@@ -349,22 +374,48 @@ if __name__ == '__main__':
     print(f'Number of machines: {machines_info.shape[0]:,}')
 
     env = simpy.Environment()
-    scheduler = Scheduler(6, env, default['tasks_path'], MachineHolder(env=env, machines_df=machines_info))
-    env.process(scheduler.run())
+    scheduler = Scheduler(7, env, default['tasks_path'], MachineHolder(env=env, machines_df=machines_info))
+    env.process(scheduler.run_baseline())
     env.run()
 
-    cpu_time, cpu_usage = zip(*CPU_USAGE)
-    print(f"Max CPU usage: {max(cpu_usage)}")
+    current_time = lambda: datetime.now().strftime(r"%d_%m_%Y_%H_%M_%S")
+
+    with open(f"logging/cpu_usage_{current_time()}.csv", "w") as f:
+        writer = csv.writer(f)
+        writer.writerow(["time", "cpu_utilization"])
+        writer.writerows(CPU_USAGE)
+
+    cpu_time, cpu_usage, cpu_utilization = zip(*CPU_USAGE)
+
     print(f"Average CPU usage: {sum(cpu_usage) / len(cpu_usage)}")
     plt.plot(cpu_time, cpu_usage)
-    plt.xlabel("Time (seconds)")
-    plt.ylabel("CPU Usage (%)")
+    plt.xlabel("Time (hours)")
+    plt.ylabel("CPU Usage (units)")
+    plt.yscale("log")
     plt.show()
 
-    memory_time, memory_usage = zip(*MEMORY_USAGE)
-    print(f"Max Memory usage: {max(memory_usage)}")
+    print(f"Average CPU utilization: {sum(cpu_utilization) / len(cpu_utilization)}")
+    plt.plot(cpu_time, cpu_utilization)
+    plt.xlabel("Time (hours)")
+    plt.ylabel("CPU Utilization (%)")
+    plt.show()
+
+    with open(f"logging/memory_usage_{current_time()}.csv", "w") as f:
+        writer = csv.writer(f)
+        writer.writerow(["time", "memory_utilization"])
+        writer.writerows(MEMORY_USAGE)
+
+
+    memory_time, memory_usage, memory_utilization = zip(*MEMORY_USAGE)
     print(f"Average Memory usage: {sum(memory_usage) / len(memory_usage)}")
     plt.plot(memory_time, memory_usage)
-    plt.xlabel("Time (seconds)")
-    plt.ylabel("Memory Usage (%)")
+    plt.xlabel("Time (hours)")
+    plt.ylabel("Memory Usage (units)")
+    plt.yscale("log")
+    plt.show()
+
+    print(f"Average Memory utilization: {sum(memory_utilization) / len(memory_utilization)}")
+    plt.plot(memory_time, memory_utilization)
+    plt.xlabel("Time (hours)")
+    plt.ylabel("Memory Utilization (%)")
     plt.show()

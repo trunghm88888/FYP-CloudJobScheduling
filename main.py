@@ -9,7 +9,9 @@ if __name__ == '__main__':
     print(f'Number of machines: {machines_info.shape[0]:,}')
     vendor = MachineHolder(machines_info)
     print(f"Total CPUs in the cluster: {vendor.total_cpu_resource:,}")
+    print(f"Min CPU: {vendor.min_cpu}, Max CPU: {vendor.max_cpu}")
     print(f"Total memory in the cluster: {vendor.total_memory_resource:,}")
+    print(f"Min memory: {vendor.min_memory}, Max memory: {vendor.max_memory}")
 
     tasks = pd.read_csv(task_path)
     print(f'Number of tasks: {tasks.shape[0]:,}')
